@@ -33,6 +33,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
@@ -282,7 +283,8 @@ public class CodeArtifactNpmDataPlane {
                                             }
                                             RepublishCheck check = checkResult.succeeded() ? checkResult.result()
                                                     : new RepublishCheck(false, 0L,
-                                                            packageIdentityFromPath(npmRequest.rest()));
+                                                            packageIdentityFromPath(npmRequest.rest()), Map.of(),
+                                                            Set.of());
                                             if (check.confirmed()) {
                                                 // "ok" is a message string in a real Verdaccio response
                                                 // (e.g. "created new package"), not a boolean; matching
@@ -320,7 +322,8 @@ public class CodeArtifactNpmDataPlane {
                                                                 npmRequest.rest() + querySuffix(context),
                                                                 reopened.result(), scope, npmRequest.domain(),
                                                                 npmRequest.repository(), check.identity(),
-                                                                check.totalAttachmentBytes(), fenceSnapshot);
+                                                                check.totalAttachmentBytes(), fenceSnapshot,
+                                                                check.readmeByVersion(), check.removedVersions());
                                                     });
                                         });
                             });
@@ -332,6 +335,13 @@ public class CodeArtifactNpmDataPlane {
     private static void respondUnlessGone(RoutingContext context, int status) {
         if (!context.response().ended() && !context.response().closed()) {
             context.response().setStatusCode(status).end();
+        }
+    }
+
+    /** Same guard as the status-only overload, for a response whose status/headers are already set. */
+    private static void respondUnlessGone(RoutingContext context, Buffer body) {
+        if (!context.response().ended() && !context.response().closed()) {
+            context.response().end(body);
         }
     }
 
@@ -403,16 +413,27 @@ public class CodeArtifactNpmDataPlane {
 
     /**
      * {@code confirmed} is {@code true} only when every version in the publish envelope already
-     * exists on Verdaccio with the same integrity, every dist-tag the envelope sends already points
-     * where it says, and every attachment in the envelope is one of those versions' tarballs.
-     * Client bytes are checked against the integrity the client itself claims, so a mismatch
-     * between the two falls through too. Anything unreadable or inconsistent is not confirmable and
-     * forwards unchanged. {@code totalAttachmentBytes} is the real decoded byte count of every
-     * attachment the envelope carries, regardless of {@code confirmed}: the caller only ever uses
-     * it when forwarding an unconfirmed publish actually succeeds, since a confirmed republish
-     * writes no new bytes at all.
+     * exists on Verdaccio with the same integrity, every dist-tag the envelope sends already
+     * points where it says, and every attachment in the envelope is one of those versions'
+     * tarballs. Client bytes are checked against the integrity the client itself claims, so a
+     * mismatch between the two falls through too. Anything unreadable or inconsistent is not
+     * confirmable and forwards unchanged. {@code totalAttachmentBytes} is the real decoded byte
+     * count of every attachment the envelope carries, regardless of {@code confirmed}: the caller
+     * only ever uses it when forwarding an unconfirmed publish actually succeeds, since a
+     * confirmed republish writes no new bytes at all. {@code readmeByVersion} is populated the
+     * same way, regardless of {@code confirmed} (a real envelope's own per-version {@code readme}
+     * field, see {@link NpmPublishEnvelopeScanner.Version} for why this, not Verdaccio's own
+     * packument response, is the only place it is ever available), and the caller only ever
+     * records it on that same successful-forward path: a confirmed republish writes nothing new,
+     * so there is nothing to capture a readme change for either. {@code removedVersions} is every
+     * version {@code storedDocument} (fetched before this write) had that this envelope does not:
+     * the one wire shape a real {@code npm unpublish <pkg>@<version>} takes (a packument PUT with
+     * that version missing, see {@link CodeArtifactService#forgetPublishedPackageVersionReadmes}'s
+     * own javadoc), computed here since {@code storedDocument} is already being fetched for the
+     * republish check anyway, at no extra Verdaccio round trip.
      */
-    private record RepublishCheck(boolean confirmed, long totalAttachmentBytes, PackageIdentity identity) {}
+    private record RepublishCheck(boolean confirmed, long totalAttachmentBytes, PackageIdentity identity,
+            Map<String, String> readmeByVersion, Set<String> removedVersions) {}
 
     private RepublishCheck checkRepublish(String backendBaseUrl, NpmRequest npmRequest, String spoolPath) {
         PackageIdentity identity = packageIdentityFromPath(npmRequest.rest());
@@ -422,11 +443,17 @@ public class CodeArtifactNpmDataPlane {
         } catch (IOException e) {
             LOG.debugv(e, "Publish for {0}/{1} is not a confirmable republish: {2}",
                     npmRequest.domain(), npmRequest.repository(), e.getMessage());
-            return new RepublishCheck(false, 0L, identity);
+            return new RepublishCheck(false, 0L, identity, Map.of(), Set.of());
         }
         long totalAttachmentBytes = envelope.attachments().values().stream()
                 .mapToLong(NpmPublishEnvelopeScanner.Attachment::size)
                 .sum();
+        Map<String, String> readmeByVersion = new HashMap<>();
+        envelope.versions().forEach((version, v) -> {
+            if (v.readme() != null) {
+                readmeByVersion.put(version, v.readme());
+            }
+        });
         Optional<JsonNode> storedDocument;
         try {
             storedDocument = verdaccioClient.fetchPackageDocument(backendBaseUrl, identity.namespace(),
@@ -434,25 +461,53 @@ public class CodeArtifactNpmDataPlane {
         } catch (IllegalStateException e) {
             LOG.warnv(e, "Could not check {0}/{1} for an existing match before publishing: {2}",
                     npmRequest.domain(), npmRequest.repository(), e.getMessage());
-            return new RepublishCheck(false, totalAttachmentBytes, identity);
+            return new RepublishCheck(false, totalAttachmentBytes, identity, readmeByVersion, Set.of());
         }
+        Set<String> removedVersions = removedVersions(storedDocument, envelope);
         if (storedDocument.isEmpty() || !isConfirmedRepublish(envelope, storedDocument.get(), identity)) {
-            return new RepublishCheck(false, totalAttachmentBytes, identity);
+            return new RepublishCheck(false, totalAttachmentBytes, identity, readmeByVersion, removedVersions);
         }
         for (NpmPublishEnvelopeScanner.Version version : envelope.versions().values()) {
             try {
                 Optional<String> stored = verdaccioClient.storedTarballIntegrity(backendBaseUrl,
                         identity.namespace(), identity.packageName(), tarballFilename(version.tarball()));
                 if (stored.isEmpty() || !stored.get().equals(version.integrity())) {
-                    return new RepublishCheck(false, totalAttachmentBytes, identity);
+                    return new RepublishCheck(false, totalAttachmentBytes, identity, readmeByVersion,
+                            removedVersions);
                 }
             } catch (IllegalStateException e) {
                 LOG.warnv(e, "Could not verify the stored tarball of {0}/{1} before publishing: {2}",
                         npmRequest.domain(), npmRequest.repository(), e.getMessage());
-                return new RepublishCheck(false, totalAttachmentBytes, identity);
+                return new RepublishCheck(false, totalAttachmentBytes, identity, readmeByVersion, removedVersions);
             }
         }
-        return new RepublishCheck(true, totalAttachmentBytes, identity);
+        return new RepublishCheck(true, totalAttachmentBytes, identity, readmeByVersion, removedVersions);
+    }
+
+    /**
+     * Every version {@code storedDocument} already had (before this write) that {@code envelope}
+     * no longer carries at all. {@code confirmed} republishes never reach this with a non-empty
+     * result in practice (every envelope version has to match something already stored for that
+     * to hold), but this is computed independent of that, from the raw version sets alone, so a
+     * version-removing publish is caught whether or not it also happens to look like a confirmed
+     * republish for the versions it keeps.
+     */
+    private static Set<String> removedVersions(Optional<JsonNode> storedDocument,
+            NpmPublishEnvelopeScanner.Envelope envelope) {
+        if (storedDocument.isEmpty()) {
+            return Set.of();
+        }
+        JsonNode storedVersions = storedDocument.get().path("versions");
+        if (!storedVersions.isObject()) {
+            return Set.of();
+        }
+        Set<String> removed = new HashSet<>();
+        storedVersions.fieldNames().forEachRemaining(version -> {
+            if (!envelope.versions().containsKey(version)) {
+                removed.add(version);
+            }
+        });
+        return removed;
     }
 
     private static boolean isConfirmedRepublish(NpmPublishEnvelopeScanner.Envelope envelope, JsonNode stored,
@@ -529,18 +584,26 @@ public class CodeArtifactNpmDataPlane {
     }
 
     /**
-     * {@code identity}/{@code totalAttachmentBytes} are only used to record real published bytes
-     * once Verdaccio's own response confirms the publish actually succeeded (200 or 201): a
-     * forward that Verdaccio itself rejects (409 on a genuine conflict, or anything else) writes
-     * nothing, and must not be counted as though it had. {@code totalAttachmentBytes} is already 0
-     * when the envelope couldn't be parsed (see {@link #checkRepublish}), so this is a no-op in
-     * that case regardless of what Verdaccio answers. {@code fenceSnapshot} is whatever {@link
+     * {@code identity}/{@code totalAttachmentBytes}/{@code readmeByVersion}/{@code
+     * removedVersions} are only ever recorded once Verdaccio's own response confirms the publish
+     * actually succeeded (200 or 201): a forward that Verdaccio itself rejects (409 on a genuine
+     * conflict, or anything else) writes nothing, and must not be counted or recorded as though it
+     * had. {@code totalAttachmentBytes} is already 0, and {@code readmeByVersion}/{@code
+     * removedVersions} already empty, when the envelope couldn't be parsed (see
+     * {@link #checkRepublish}), so all three become no-ops in that case regardless of what
+     * Verdaccio answers. {@code fenceSnapshot} is whatever {@link
      * CodeArtifactService#currentContainerBackedPackageFence} returned at the caller's own earlier
      * snapshot point, before this request was ever forwarded.
+     *
+     * <p>All of this bookkeeping runs in one {@code executeBlocking} call, and the response is
+     * only piped to the client once that call completes, not before: a client that requests this
+     * version's readme immediately after seeing its publish succeed must not be able to observe a
+     * window where the publish already finished but the readme has not been recorded yet.
      */
     private void forwardSpooled(RoutingContext context, String backendBaseUrl, String backendPath,
             ReadStream<Buffer> body, AuthorizationTokenScope scope, String domain, String repository,
-            PackageIdentity identity, long totalAttachmentBytes, long fenceSnapshot) {
+            PackageIdentity identity, long totalAttachmentBytes, long fenceSnapshot,
+            Map<String, String> readmeByVersion, Set<String> removedVersions) {
         URI backend = URI.create(backendBaseUrl);
         RequestOptions options = new RequestOptions()
                 .setHost(backend.getHost())
@@ -561,24 +624,60 @@ public class CodeArtifactNpmDataPlane {
                 }
                 HttpClientResponse response = upstreamResponse.result();
                 copyResponseHeaders(context, response);
-                response.pipeTo(context.response());
-                // Piped on first, not after: the client is never made to wait on the call below.
-                // That call is fast and in-memory-only now (no sidecar round trip of its own,
-                // unlike the one this replaced), but it still runs off the event loop, in
-                // executeBlocking, on principle: CodeArtifactService is a plain CDI bean Vert.x
-                // knows nothing about, so nothing here can guarantee it stays that way forever,
-                // and the cost of getting this wrong (stalling every request on this event loop,
-                // not just this one) is high enough that "it happens to be cheap today" is not a
-                // reason to call a synchronized service method straight from a response callback.
-                if (totalAttachmentBytes > 0 && (response.statusCode() == 200 || response.statusCode() == 201)) {
+                // response.body() attaches its handler on this same event-loop tick, same as
+                // pipeTo used to: a publish response is always a small JSON acknowledgement, never
+                // tarball-sized, so buffering it rather than streaming it costs nothing. Unlike
+                // pipeTo, buffering lets the client-visible response wait on the bookkeeping below
+                // without risking the response stream auto-ending for having no consumer attached
+                // in time (confirmed the hard way: deferring pipeTo itself past this tick threw
+                // "Response already ended").
+                response.body().onComplete(bodyResult -> {
+                    if (bodyResult.failed()) {
+                        respondUnlessGone(context, 502);
+                        return;
+                    }
+                    Buffer responseBody = bodyResult.result();
+                    boolean forwardSucceeded = response.statusCode() == 200 || response.statusCode() == 201;
+                    boolean needsBytes = totalAttachmentBytes > 0 && forwardSucceeded;
+                    boolean needsReadmeCapture = !readmeByVersion.isEmpty() && forwardSucceeded;
+                    boolean needsReadmeForget = !removedVersions.isEmpty() && forwardSucceeded;
+                    if (!needsBytes && !needsReadmeCapture && !needsReadmeForget) {
+                        respondUnlessGone(context, responseBody);
+                        return;
+                    }
+                    // Each still runs off the event loop, in executeBlocking, on principle:
+                    // CodeArtifactService is a plain CDI bean Vert.x knows nothing about, so
+                    // nothing here can guarantee it stays that way forever, and the cost of
+                    // getting this wrong (stalling every request on this event loop, not just this
+                    // one) is high enough that "it happens to be cheap today" is not a reason to
+                    // call a synchronized service method straight from a response callback.
                     vertx.<Void>executeBlocking(promise -> {
-                        service.recordContainerBackedAssetBytes(scope.region(), domain, scope.owner(), repository,
-                                "npm", identity.namespace(), identity.packageName(), totalAttachmentBytes,
-                                fenceSnapshot);
+                        if (needsBytes) {
+                            service.recordContainerBackedAssetBytes(scope.region(), domain, scope.owner(),
+                                    repository, "npm", identity.namespace(), identity.packageName(),
+                                    totalAttachmentBytes, fenceSnapshot);
+                        }
+                        if (needsReadmeCapture) {
+                            readmeByVersion.forEach((version, readme) ->
+                                    service.recordPublishedPackageVersionReadme(scope.region(), domain,
+                                            scope.owner(), repository, "npm", identity.namespace(),
+                                            identity.packageName(), version, readme, fenceSnapshot));
+                        }
+                        if (needsReadmeForget) {
+                            service.forgetPublishedPackageVersionReadmes(scope.region(), domain, scope.owner(),
+                                    repository, "npm", identity.namespace(), identity.packageName(),
+                                    removedVersions);
+                        }
                         promise.complete();
-                    }, false).onFailure(e -> LOG.warnv(e, "Could not record npm asset bytes for {0}/{1} package "
-                            + "''{2}'': {3}", domain, repository, identity.packageName(), e.getMessage()));
-                }
+                    }, false).onComplete(result -> {
+                        if (result.failed()) {
+                            LOG.warnv(result.cause(), "Could not record npm publish bookkeeping for {0}/{1} "
+                                    + "package ''{2}'': {3}", domain, repository, identity.packageName(),
+                                    result.cause().getMessage());
+                        }
+                        respondUnlessGone(context, responseBody);
+                    });
+                });
             });
             clientReq.send(body).onFailure(ignored -> respondUnlessGone(context, 502));
         });

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.codeartifact;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
@@ -433,6 +434,139 @@ class CodeArtifactNpmDockerIntegrationTest {
                 .get("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + packageName)
                 .then().statusCode(404);
         assertEquals(assetSizeBytesBeforePublish, describeDomainAssetSizeBytes());
+    }
+
+    /**
+     * A second real finding found alongside the npm readme redesign itself: the native unpublish
+     * path above cleans up the byte count and the deletion fence, but a first version of that same
+     * fix left {@code packageVersionReadmes} untouched, so {@code GetPackageVersionReadme} would
+     * keep answering for a package a real npm registry (and real CodeArtifact) now 404s on,
+     * forever, since nothing else ever revisits that store once it's written. A throwaway
+     * package, not {@link #PACKAGE_NAME}, for the same reason as the tests above.
+     */
+    @Test
+    @Order(13)
+    void nativeNpmUnpublishCleansUpTheCapturedReadmeToo() {
+        String packageName = "unpublish-readme-pkg";
+        byte[] tarball = "unpublish readme throwaway tarball".getBytes(StandardCharsets.UTF_8);
+        String envelope = "{\"name\":\"" + packageName + "\",\"versions\":{\"1.0.0\":{\"name\":\"" + packageName
+                + "\",\"version\":\"1.0.0\",\"readme\":\"# Soon to be unpublished\",\"dist\":{\"tarball\":"
+                + "\"http://ignored/" + packageName + "-1.0.0.tgz\""
+                + "}}},\"_attachments\":{\"" + packageName + "-1.0.0.tgz\":{\"content_type\":"
+                + "\"application/octet-stream\",\"data\":\""
+                + Base64.getEncoder().encodeToString(tarball) + "\",\"length\":" + tarball.length + "}}}";
+
+        given().header("Authorization", "Bearer " + bearerToken).contentType("application/json").body(envelope)
+                .put("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + packageName)
+                .then().statusCode(anyOf201Or200());
+
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version/readme?domain=" + DOMAIN + "&repository=" + REPO + "&format=npm&package="
+                        + packageName + "&version=1.0.0")
+                .then().statusCode(200)
+                .body("readme", equalTo("# Soon to be unpublished"));
+
+        String rev = given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + packageName)
+                .then().statusCode(200)
+                .extract().jsonPath().getString("_rev");
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .delete("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + packageName + "/-rev/" + rev)
+                .then().statusCode(anyOf201Or200());
+
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version/readme?domain=" + DOMAIN + "&repository=" + REPO + "&format=npm&package="
+                        + packageName + "&version=1.0.0")
+                .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
+    }
+
+    /**
+     * The companion gap to the whole-package unpublish fix above, found by Qodo review: a real
+     * {@code npm unpublish <pkg>@<version>} does not take the whole-package {@code DELETE} path at
+     * all. At the wire level it is an ordinary-looking {@code PUT} to the bare package path
+     * carrying the current packument with just that one version's entry removed, no new
+     * {@code _attachments} (confirmed by fetching the real packument and modifying it in place,
+     * not hand-building one). Without detecting this shape too, {@code GetPackageVersionReadme}
+     * would keep answering for one version of a package a real npm registry now 404s on, while
+     * the package's other, untouched version's own readme must be unaffected.
+     */
+    @Test
+    @Order(14)
+    void singleVersionNpmUnpublishCleansUpOnlyThatVersionsReadme() throws IOException {
+        String packageName = "unpublish-one-version-pkg";
+        byte[] tarballV1 = "unpublish one version v1".getBytes(StandardCharsets.UTF_8);
+        byte[] tarballV2 = "unpublish one version v2".getBytes(StandardCharsets.UTF_8);
+        String envelope = "{\"name\":\"" + packageName + "\",\"versions\":{"
+                + "\"1.0.0\":{\"name\":\"" + packageName + "\",\"version\":\"1.0.0\",\"readme\":\"# v1\","
+                + "\"dist\":{\"tarball\":\"http://ignored/" + packageName + "-1.0.0.tgz\"}},"
+                + "\"2.0.0\":{\"name\":\"" + packageName + "\",\"version\":\"2.0.0\",\"readme\":\"# v2\","
+                + "\"dist\":{\"tarball\":\"http://ignored/" + packageName + "-2.0.0.tgz\"}}"
+                + "},\"_attachments\":{"
+                + "\"" + packageName + "-1.0.0.tgz\":{\"content_type\":\"application/octet-stream\",\"data\":\""
+                + Base64.getEncoder().encodeToString(tarballV1) + "\",\"length\":" + tarballV1.length + "},"
+                + "\"" + packageName + "-2.0.0.tgz\":{\"content_type\":\"application/octet-stream\",\"data\":\""
+                + Base64.getEncoder().encodeToString(tarballV2) + "\",\"length\":" + tarballV2.length + "}}}";
+
+        given().header("Authorization", "Bearer " + bearerToken).contentType("application/json").body(envelope)
+                .put("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + packageName)
+                .then().statusCode(anyOf201Or200());
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version/readme?domain=" + DOMAIN + "&repository=" + REPO + "&format=npm&package="
+                        + packageName + "&version=1.0.0")
+                .then().statusCode(200).body("readme", equalTo("# v1"));
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version/readme?domain=" + DOMAIN + "&repository=" + REPO + "&format=npm&package="
+                        + packageName + "&version=2.0.0")
+                .then().statusCode(200).body("readme", equalTo("# v2"));
+
+        // A real `npm unpublish <pkg>@1.0.0`: GET the current packument, drop that one version's
+        // entry, PUT the whole thing straight back with its own _rev unchanged and no attachment.
+        String packument = given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + packageName)
+                .then().statusCode(200)
+                .extract().asString();
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode root = (ObjectNode) mapper.readTree(packument);
+        ((ObjectNode) root.get("versions")).remove("1.0.0");
+
+        given().header("Authorization", "Bearer " + bearerToken).contentType("application/json")
+                .body(mapper.writeValueAsString(root))
+                .put("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + packageName)
+                .then().statusCode(anyOf201Or200());
+
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version/readme?domain=" + DOMAIN + "&repository=" + REPO + "&format=npm&package="
+                        + packageName + "&version=1.0.0")
+                .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version/readme?domain=" + DOMAIN + "&repository=" + REPO + "&format=npm&package="
+                        + packageName + "&version=2.0.0")
+                .then().statusCode(200).body("readme", equalTo("# v2"));
+    }
+
+    /**
+     * The fix for a real finding: a first implementation answered this live from Verdaccio's own
+     * packument, which turned out, checked directly against this same live container, to hoist
+     * {@code readme} to the top level only (the single most-recently-published version), dropping
+     * the per-version field entirely from its own GET response — even though a real npm client's
+     * publish envelope (the real fixture {@link #setUp} loads, captured from an actual {@code npm
+     * publish}) genuinely sends one per version. This exercises the real capture-at-publish-time
+     * path end to end against that same live container: the exact text the fixture's own
+     * {@code versions["1.0.0"].readme} field carries ({@code "ERROR: No README data found!"},
+     * npm's own literal placeholder for a package with no real {@code README.md}, not an absent
+     * field) must come back unchanged.
+     */
+    @Test
+    @Order(15)
+    void getPackageVersionReadmeReturnsWhatTheRealPublishEnvelopeSent() {
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version/readme?domain=" + DOMAIN + "&repository=" + REPO + "&format=npm&package="
+                        + PACKAGE_NAME + "&version=1.0.0")
+                .then().statusCode(200)
+                .body("readme", equalTo("ERROR: No README data found!"))
+                .body("package", equalTo(PACKAGE_NAME))
+                .body("version", equalTo("1.0.0"));
     }
 
     /**
